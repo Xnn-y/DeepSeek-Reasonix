@@ -98,6 +98,10 @@ interface State {
   // frontend-observed harness state; no model cooperation needed.
   turnStartAt: number;
   turnTokens: number;
+  // sessionCostUsd is the running spend for this session — each turn's estimated
+  // cost (provider currency, despite the wire field name) summed so the status bar
+  // can show what the conversation has cost. Reset with the session.
+  sessionCostUsd: number;
   // retry drives the transient "retrying (n/m)" indicator while the provider
   // re-attempts the connection; cleared by the next stream event or turn end.
   retry?: { attempt: number; max: number };
@@ -113,6 +117,7 @@ const initialState: State = {
   jobs: [],
   turnStartAt: 0,
   turnTokens: 0,
+  sessionCostUsd: 0,
   seq: 0,
 };
 
@@ -283,7 +288,8 @@ function applyEvent(s: State, e: WireEvent): State {
       // Usage arrives once per model step; sum the output across steps for the
       // turn's running token tally.
       const turnTokens = s.turnTokens + (e.usage?.completionTokens ?? 0);
-      return { ...s, usage: e.usage, context: { ...s.context, used }, turnTokens };
+      const sessionCostUsd = s.sessionCostUsd + (e.usage?.costUsd ?? 0);
+      return { ...s, usage: e.usage, context: { ...s.context, used }, turnTokens, sessionCostUsd };
     }
 
     case "notice":
@@ -569,9 +575,9 @@ export function useController() {
     return undefined;
   }, []);
 
-  const approve = useCallback((id: string, allow: boolean, session: boolean) => {
+  const approve = useCallback((id: string, allow: boolean, session: boolean, persist: boolean) => {
     dispatch({ type: "clearApproval" });
-    app.Approve(id, allow, session).catch(() => {});
+    app.Approve(id, allow, session, persist).catch(() => {});
   }, []);
 
   // answerQuestion resolves an ask_request with the user's per-question picks.
@@ -580,13 +586,16 @@ export function useController() {
     app.AnswerQuestion(id, answers).catch(() => {});
   }, []);
 
-  const setPlan = useCallback((on: boolean) => {
-    app.SetPlanMode(on).catch(() => {});
-  }, []);
-
-  // setBypass toggles YOLO mode (auto-approve every tool call this session).
-  const setBypass = useCallback((on: boolean) => {
-    app.SetBypass(on).catch(() => {});
+  // setControllerMode pushes plan/yolo/normal to the kernel in one atomic call —
+  // the composer's single seam for gating, so it never sequences SetPlanMode +
+  // SetBypass and can't leave the backend in a half-applied mode.
+  const setControllerMode = useCallback((mode: "plan" | "yolo" | "normal"): Promise<void> => {
+    return app
+      .SetMode(mode)
+      .then(() => {
+        if (mode === "yolo") dispatch({ type: "clearApproval" });
+      })
+      .catch(() => {});
   }, []);
 
   const newSession = useCallback(async () => {
@@ -740,8 +749,7 @@ export function useController() {
     cancel,
     approve,
     answerQuestion,
-    setPlan,
-    setBypass,
+    setControllerMode,
     newSession,
     listSessions,
     resumeSession,

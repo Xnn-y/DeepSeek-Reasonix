@@ -142,8 +142,7 @@ export default function App() {
     cancel,
     approve,
     answerQuestion,
-    setPlan,
-    setBypass,
+    setControllerMode,
     newSession,
     listSessions,
     resumeSession,
@@ -200,16 +199,17 @@ export default function App() {
     [effectiveSidebarWidth, viewportWidth, workspaceFileTreePanelWidth, workspacePanelWidth, workspacePreviewModeActive],
   );
 
+  const syncModeToController = useCallback((m: Mode) => setControllerMode(m), [setControllerMode]);
+
   // applyMode is the single source of truth for the input mode: it updates the
   // local pill and pushes the matching gate state to the controller (plan = read
   // only; yolo = auto-approve every tool call). normal clears both.
   const applyMode = useCallback(
     (m: Mode) => {
       setMode(m);
-      setPlan(m === "plan");
-      setBypass(m === "yolo");
+      void syncModeToController(m);
     },
-    [setPlan, setBypass],
+    [syncModeToController],
   );
   // Shift+Tab cycles normal → plan → yolo → normal.
   const cycleMode = useCallback(() => {
@@ -222,21 +222,30 @@ export default function App() {
   const switchModel = useCallback(
     async (name: string) => {
       await setModel(name);
-      if (mode === "plan") setPlan(true);
-      else if (mode === "yolo") setBypass(true);
+      await syncModeToController(mode);
     },
-    [setModel, mode, setPlan, setBypass],
+    [setModel, mode, syncModeToController],
   );
 
+  // Startup and workspace/model rebuilds create a fresh controller in normal
+  // mode. Re-apply the UI mode once the controller is ready, including the case
+  // where the user picked YOLO while boot was still loading and SetBypass was a
+  // harmless no-op.
+  useEffect(() => {
+    if (state.meta?.ready !== true || mode === "normal") return;
+    void syncModeToController(mode);
+  }, [state.meta, mode, syncModeToController]);
+
   // The live task list pinned above the composer comes from the most recent
-  // top-level todo_write call; it stays visible while work remains, clears itself
-  // once every item is completed, and can be dismissed by the user (the ✕). A
-  // dismissal is keyed to that list's id, so a fresh todo_write (a new task)
-  // brings the panel back.
+  // successful top-level todo_write result; failed or still-running attempts do
+  // not advance the canonical panel state. It stays visible while work remains,
+  // clears itself once every item is completed, and can be dismissed by the user
+  // (the ✕). A dismissal is keyed to that list's id, so a fresh accepted
+  // todo_write brings the panel back.
   const todoItem = useMemo(() => {
     for (let i = state.items.length - 1; i >= 0; i--) {
       const it = state.items[i];
-      if (it.kind === "tool" && it.name === "todo_write" && !it.parentId) return it;
+      if (it.kind === "tool" && it.name === "todo_write" && !it.parentId && it.status === "done" && !it.error) return it;
     }
     return null;
   }, [state.items]);
@@ -277,7 +286,7 @@ export default function App() {
   // (/skill, /hooks, /mcp) — goes straight to Submit, which the controller
   // resolves (a turn, or a listing Notice).
   const handleSend = useCallback(
-    (displayText: string, submitText = displayText) => {
+    async (displayText: string, submitText = displayText) => {
       const trimmed = displayText.trim();
       const model = /^\/model\s+(\S+)$/.exec(trimmed);
       if (model) {
@@ -312,9 +321,10 @@ export default function App() {
         notice(t("settings.themeUnknown", { name: arg }), "warn");
         return;
       }
+      await syncModeToController(mode);
       send(trimmed, submitText.trim());
     },
-    [switchModel, openMemory, send, notice, t],
+    [switchModel, openMemory, syncModeToController, mode, send, notice, t],
   );
 
   const addToChat = useCallback((text: string) => {
@@ -669,22 +679,25 @@ export default function App() {
           <div className="sidebar__brand">
             <img src={logo} alt="" className="sidebar__logo" />
             <span>Reasonix</span>
-            <button
-              className={`sidebar__toggle${sidebarExpandBlocked ? " sidebar__toggle--blocked" : ""}`}
-              onClick={sidebarExpandBlocked ? undefined : toggleSidebar}
-              aria-label={sidebarToggleTitle}
-              aria-disabled={sidebarExpandBlocked}
-            >
-              {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
-            </button>
+            <Tooltip label={sidebarToggleTitle}>
+              <button
+                className={`sidebar__toggle${sidebarExpandBlocked ? " sidebar__toggle--blocked" : ""}`}
+                onClick={sidebarExpandBlocked ? undefined : toggleSidebar}
+                aria-label={sidebarToggleTitle}
+                aria-disabled={sidebarExpandBlocked}
+              >
+                {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+              </button>
+            </Tooltip>
           </div>
 
-          <Tooltip label={state.running ? t("common.busyHint") : t("topbar.newSession")} fill disabled={!sidebarCollapsed && !state.running}>
+          <Tooltip label={t("topbar.newSession")} fill>
             <button
               className="sidebar__new"
-              onClick={() => void startNewSession()}
-              disabled={state.running}
-              aria-label={state.running ? t("common.busyHint") : t("topbar.newSession")}
+              onClick={() => {
+                if (state.running) cancel();
+                void startNewSession();
+              }}
             >
               <SquarePen size={15} />
               <span>{t("topbar.newSession")}</span>
@@ -694,12 +707,14 @@ export default function App() {
           <section className="sidebar__section">
             <div className="sidebar__section-head">
               <div className="sidebar__section-title">{t("sidebar.conversations")}</div>
-              <button
-                className="sidebar__view-all"
-                onClick={() => void openHistory()}
-              >
-                {t("sidebar.viewAll")}
-              </button>
+              <Tooltip label={t("topbar.history")}>
+                <button
+                  className="sidebar__view-all"
+                  onClick={() => void openHistory()}
+                >
+                  {t("sidebar.viewAll")}
+                </button>
+              </Tooltip>
             </div>
             <div className="sidebar__sessions">
               {sidebarSessions.length === 0 ? (
@@ -733,7 +748,7 @@ export default function App() {
                         >
                           <MessageSquare size={14} />
                           <span className="sidebar-session__body">
-                            <span className="sidebar-session__title">{title}</span>
+                            <Tooltip className="sidebar-session__title" label={`${title}\n${session.path}`}>{title}</Tooltip>
                             <span className="sidebar-session__meta">
                               {session.current ? t("history.current") : sessionTime(sessionActivityTime(session))}
                             </span>
@@ -796,7 +811,7 @@ export default function App() {
           </section>
 
           <nav className="sidebar__nav">
-            <Tooltip label={t("topbar.history")} fill disabled={!sidebarCollapsed}>
+            <Tooltip label={t("topbar.history")} fill>
               <button
                 className="sidebar__navitem sidebar__navitem--sessions"
                 onClick={() => void openHistory()}
@@ -805,23 +820,22 @@ export default function App() {
                 <span>{t("topbar.history")}</span>
               </button>
             </Tooltip>
-            <Tooltip label={t("topbar.memory")} fill disabled={!sidebarCollapsed}>
+            <Tooltip label={t("topbar.memory")} fill>
               <button className="sidebar__navitem" onClick={() => void openMemory()}>
                 <Brain size={15} />
                 <span>{t("topbar.memory")}</span>
               </button>
             </Tooltip>
-            <Tooltip label={t("caps.title")} fill disabled={!sidebarCollapsed}>
+            <Tooltip label={t("caps.title")} fill>
               <button className="sidebar__navitem" onClick={() => setCapsOpen(true)}>
                 <Blocks size={15} />
                 <span>{t("caps.title")}</span>
               </button>
             </Tooltip>
-            <Tooltip label={state.running ? t("common.busyHint") : t("topbar.settings")} fill disabled={!sidebarCollapsed && !state.running}>
+            <Tooltip label={t("topbar.settings")} fill>
               <button
                 className="sidebar__navitem"
                 onClick={() => setSettingsOpen(true)}
-                disabled={state.running}
               >
                 <SettingsIcon size={15} />
                 <span>{t("topbar.settings")}</span>
@@ -851,13 +865,14 @@ export default function App() {
               <span className="topbar__model">{state.meta?.label ?? "…"}</span>
             </div>
             <div className="topbar__spacer" />
-            <button
-              className="chip chip--icon topbar__workspace-toggle"
-              onClick={toggleWorkspacePanel}
-              aria-label={workspacePanelOpen ? t("workspace.close") : t("workspace.open")}
-            >
-              {workspacePanelOpen ? <PanelRightClose size={13} /> : <PanelRightOpen size={13} />}
-            </button>
+            <Tooltip label={workspacePanelOpen ? t("workspace.close") : t("workspace.open")}>
+              <button
+                className="chip chip--icon topbar__workspace-toggle"
+                onClick={toggleWorkspacePanel}
+              >
+                {workspacePanelOpen ? <PanelRightClose size={13} /> : <PanelRightOpen size={13} />}
+              </button>
+            </Tooltip>
             <div className="topbar__actions">
               <Tooltip label={t("topbar.history")}>
                 <button
@@ -877,20 +892,21 @@ export default function App() {
                   <Blocks size={13} />
                 </button>
               </Tooltip>
-              <Tooltip label={state.running ? t("common.busyHint") : t("topbar.settings")}>
+              <Tooltip label={t("topbar.settings")}>
                 <button
                   className="chip chip--icon"
                   onClick={() => setSettingsOpen(true)}
-                  disabled={state.running}
                 >
                   <SettingsIcon size={13} />
                 </button>
               </Tooltip>
-              <Tooltip label={state.running ? t("common.busyHint") : t("topbar.newSession")}>
+              <Tooltip label={t("topbar.newSession")}>
                 <button
                   className="chip chip--icon"
-                  onClick={() => void startNewSession()}
-                  disabled={state.running}
+                  onClick={() => {
+                    if (state.running) cancel();
+                    void startNewSession();
+                  }}
                 >
                   <SquarePen size={13} />
                 </button>
@@ -920,21 +936,27 @@ export default function App() {
             {state.approval && (
               <ApprovalModal
                 approval={state.approval}
-                onAnswer={(allow, session) => {
+                onAnswer={(allow, session, persist) => {
                   // Approving an exit_plan_mode plan leaves plan mode (the controller
                   // flips the executor; mirror it here for the indicator).
                   if (state.approval!.tool === "exit_plan_mode" && allow) setMode("normal");
-                  approve(state.approval!.id, allow, session);
+                  approve(state.approval!.id, allow, session, persist);
                 }}
                 onRevisePlan={(text) => {
                   setPendingPlanRevision(text);
-                  approve(state.approval!.id, false, false);
+                  approve(state.approval!.id, false, false, false);
                 }}
                 onExitPlan={() => {
-                  setMode("normal");
-                  setPlan(false);
-                  approve(state.approval!.id, false, false);
+                  applyMode("normal");
+                  approve(state.approval!.id, false, false, false);
                 }}
+              />
+            )}
+            {state.ask && (
+              <AskCard
+                ask={state.ask}
+                onAnswer={answerQuestion}
+                onDismiss={() => answerQuestion(state.ask!.id, [])}
               />
             )}
             <Composer
@@ -946,7 +968,8 @@ export default function App() {
               onCycleMode={cycleMode}
               onPickFolder={switchFolder}
               insertRequest={composerInsertRequest}
-              disabled={state.meta?.ready === false || state.approval != null}
+              disabled={state.meta?.ready === false || state.approval != null || state.ask != null}
+              ready={state.meta?.ready === true}
             />
             <StatusBar
               meta={state.meta}
@@ -958,6 +981,7 @@ export default function App() {
               running={state.running}
               mode={mode}
               turnStartAt={state.turnStartAt}
+              cost={state.sessionCostUsd}
 	      turnTokens={state.turnTokens}
 	      retry={state.retry}
 	      onSwitchModel={switchModel}
@@ -998,14 +1022,6 @@ export default function App() {
           changesRefreshKey={workspaceChangesRefreshKey}
         />
       </div>
-
-      {state.ask && (
-        <AskCard
-          ask={state.ask}
-          onAnswer={answerQuestion}
-          onDismiss={() => answerQuestion(state.ask!.id, [])}
-        />
-      )}
 
       {memView !== null && (
         <MemoryPanel

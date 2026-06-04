@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, PauseCircle } from "lucide-react";
 import { useT } from "../lib/i18n";
 import type { WireApproval } from "../lib/types";
+import { PromptAction, PromptDetailToggle, PromptShelf } from "./PromptShelf";
 
 export function ApprovalModal({
   approval,
@@ -10,7 +10,7 @@ export function ApprovalModal({
   onExitPlan,
 }: {
   approval: WireApproval;
-  onAnswer: (allow: boolean, session: boolean) => void;
+  onAnswer: (allow: boolean, session: boolean, persist: boolean) => void;
   onRevisePlan?: (text: string) => void;
   onExitPlan?: () => void;
 }) {
@@ -25,14 +25,15 @@ export function ApprovalModal({
 
   const choosePlanAction = (key: string) => {
     if (key === "1") setRevisionOpen((open) => !open);
-    else if (key === "2") onAnswer(true, false);
-    else if (key === "3" || key === "Escape") (onExitPlan ?? (() => onAnswer(false, false)))();
+    else if (key === "2") onAnswer(true, false, false);
+    else if (key === "3" || key === "Escape") (onExitPlan ?? (() => onAnswer(false, false, false)))();
   };
 
   const chooseToolAction = (key: string) => {
-    if (key === "1") onAnswer(true, false);
-    else if (key === "2") onAnswer(true, true);
-    else if (key === "3" || key === "Escape") onAnswer(false, false);
+    if (key === "1") onAnswer(true, false, false);
+    else if (key === "2") onAnswer(true, true, false);
+    else if (key === "3") onAnswer(true, true, true);
+    else if (key === "4" || key === "Escape") onAnswer(false, false, false);
   };
 
   useEffect(() => {
@@ -47,7 +48,7 @@ export function ApprovalModal({
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName.toLowerCase();
       if (tag === "input" || tag === "textarea" || target?.isContentEditable) return;
-      if (event.key !== "1" && event.key !== "2" && event.key !== "3" && event.key !== "Escape") return;
+      if (event.key !== "1" && event.key !== "2" && event.key !== "3" && event.key !== "4" && event.key !== "Escape") return;
       event.preventDefault();
       if (isPlanApproval) choosePlanAction(event.key);
       else chooseToolAction(event.key);
@@ -69,42 +70,28 @@ export function ApprovalModal({
     onRevisePlan?.(text);
   };
 
-  const choice = (key: string, label: string, onClick: () => void, primary = false) => (
-    <button className={`approval-action${primary ? " approval-action--primary" : ""}`} onClick={onClick}>
-      <span className="approval-action__key">{key}</span>
-      <span className="approval-action__label">{label}</span>
-    </button>
-  );
-
   // The plan is already shown above as the assistant's reply; this is just the gate.
   if (isPlanApproval) {
     return (
-      <div className="approval-shelf" aria-live="polite">
-        <div
-          ref={cardRef}
-          className="approval-shelf__bar"
-          role="dialog"
-          aria-modal="false"
-          aria-labelledby="plan-approval-title"
-          tabIndex={-1}
-        >
-          <div className="approval-shelf__summary">
-            <PauseCircle size={16} aria-hidden="true" />
-            <div className="approval-shelf__copy">
-              <div id="plan-approval-title" className="approval-shelf__title">
-                {t("approval.planReady")}
-              </div>
-              <div className="approval-shelf__meta">{t("approval.planReadyHint")}</div>
-            </div>
-          </div>
-          <div className="approval-shelf__actions">
-            {choice("1", t("approval.revisePlan"), () => setRevisionOpen((open) => !open))}
-            {choice("2", t("approval.startExecution"), () => onAnswer(true, false), true)}
-            {choice("3", t("approval.exitPlan"), () => (onExitPlan ?? (() => onAnswer(false, false)))())}
-          </div>
-        </div>
+      <PromptShelf
+        barRef={cardRef}
+        titleId="plan-approval-title"
+        title={t("approval.planReady")}
+        meta={t("approval.planReadyHint")}
+        actions={
+          <>
+            <PromptAction keyLabel="1" label={t("approval.revisePlan")} onClick={() => setRevisionOpen((open) => !open)} />
+            <PromptAction keyLabel="2" label={t("approval.startExecution")} onClick={() => onAnswer(true, false, false)} selected />
+            <PromptAction
+              keyLabel="3"
+              label={t("approval.exitPlan")}
+              onClick={() => (onExitPlan ?? (() => onAnswer(false, false, false)))()}
+            />
+          </>
+        }
+      >
         {revisionOpen && (
-          <div className="approval-shelf__panel plan-revision">
+          <div className="plan-revision">
             <textarea
               ref={inputRef}
               className="plan-revision__input"
@@ -127,49 +114,41 @@ export function ApprovalModal({
             </div>
           </div>
         )}
-      </div>
+      </PromptShelf>
     );
   }
 
   return (
-    <div className="approval-shelf" aria-live="polite">
-      <div
-        ref={cardRef}
-        className="approval-shelf__bar"
-        role="dialog"
-        aria-modal="false"
-        aria-labelledby="tool-approval-title"
-        tabIndex={-1}
-      >
-        <div className="approval-shelf__summary">
-          <PauseCircle size={16} aria-hidden="true" />
-          <div className="approval-shelf__copy">
-            <div id="tool-approval-title" className="approval-shelf__title">
-              {t("approval.toolPending")}
-            </div>
-            <div className="approval-shelf__meta">
-              <span className="tool__name">{approval.tool}</span>
-              {subject && <span className="approval-shelf__subject"> · {subject}</span>}
-            </div>
-          </div>
-        </div>
-        <div className="approval-shelf__actions">
+    <PromptShelf
+      barRef={cardRef}
+      titleId="tool-approval-title"
+      title={t("approval.toolPending")}
+      meta={
+        <>
+          <span className="tool__name">{approval.tool}</span>
+          {subject && <span className="prompt-shelf__subject"> · {subject}</span>}
+        </>
+      }
+      actions={
+        <>
           {subject && (
-            <button className="approval-detail-toggle" onClick={() => setDetailsOpen((open) => !open)}>
-              <span>{detailsOpen ? t("approval.hideDetails") : t("approval.details")}</span>
-              {detailsOpen ? <ChevronUp size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
-            </button>
+            <PromptDetailToggle
+              open={detailsOpen}
+              label={t("approval.details")}
+              openLabel={t("approval.hideDetails")}
+              onClick={() => setDetailsOpen((open) => !open)}
+            />
           )}
-          {choice("1", t("approval.allowOnce"), () => onAnswer(true, false), true)}
-          {choice("2", t("approval.allowSession"), () => onAnswer(true, true))}
-          {choice("3", t("approval.deny"), () => onAnswer(false, false))}
-        </div>
-      </div>
+          <PromptAction keyLabel="1" label={t("approval.allowOnce")} onClick={() => onAnswer(true, false, false)} selected />
+          <PromptAction keyLabel="2" label={t("approval.allowSession")} onClick={() => onAnswer(true, true, false)} />
+          <PromptAction keyLabel="3" label={t("approval.allowPersistent")} onClick={() => onAnswer(true, true, true)} />
+          <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
+        </>
+      }
+    >
       {detailsOpen && subject && (
-        <div className="approval-shelf__panel">
-          <pre className="approval-subject">{subject}</pre>
-        </div>
+        <pre className="approval-subject">{subject}</pre>
       )}
-    </div>
+    </PromptShelf>
   );
 }

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { ArrowUp, Check, ChevronDown, Eye, FileText, Folder, FolderGit2, FolderPlus, Search, Square, Trash2, X } from "lucide-react";
-import { app } from "../lib/bridge";
+import { app, onFilesDropped } from "../lib/bridge";
 import { useT } from "../lib/i18n";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
 import type { CommandInfo, ComposerInsertRequest, DirEntry, Mode, SlashArgItem, SlashArgsResult, WorkspaceView } from "../lib/types";
@@ -103,6 +103,7 @@ export function Composer({
   onPickFolder,
   insertRequest,
   disabled,
+  ready,
 }: {
   running: boolean;
   mode: Mode;
@@ -115,6 +116,10 @@ export function Composer({
   onPickFolder: (path?: string) => Promise<string>;
   insertRequest?: ComposerInsertRequest | null;
   disabled?: boolean;
+  // ready/cwd re-trigger the command fetch: Commands() returns only built-ins
+  // until boot.Build finishes (the controller, hence skills/custom/MCP, is nil
+  // before then), and the available set changes when the workspace switches.
+  ready?: boolean;
 }) {
   const t = useT();
   const [text, setText] = useState("");
@@ -156,7 +161,7 @@ export function Composer({
   const [commands, setCommands] = useState<CommandInfo[]>([]);
   useEffect(() => {
     app.Commands().then(setCommands).catch(() => {});
-  }, []);
+  }, [ready, cwd]);
 
   const slashQuery = useMemo(() => {
     if (!text.startsWith("/") || /\s/.test(text)) return null;
@@ -218,7 +223,9 @@ export function Composer({
   }, [atRaw]);
 
   const [entries, setEntries] = useState<DirEntry[]>([]);
+  const [searchEntries, setSearchEntries] = useState<DirEntry[]>([]);
   const dirCache = useRef<Record<string, DirEntry[]>>({});
+  const searchCache = useRef<Record<string, DirEntry[]>>({});
   useEffect(() => {
     if (atRaw === null) return;
     const cached = dirCache.current[atDir];
@@ -240,9 +247,42 @@ export function Composer({
     };
     // re-fetch only when the menu opens or the directory level changes
   }, [atRaw === null, atDir]);
+  useEffect(() => {
+    if (atRaw === null || atDir !== "" || atFrag === "") {
+      setSearchEntries([]);
+      return;
+    }
+    const cached = searchCache.current[atFrag];
+    if (cached) {
+      setSearchEntries(cached);
+      return;
+    }
+    setSearchEntries([]);
+    let live = true;
+    app
+      .SearchFileRefs(atFrag)
+      .then((es) => {
+        const list = es ?? [];
+        searchCache.current[atFrag] = list;
+        if (live) setSearchEntries(list);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [atRaw === null, atDir, atFrag]);
   const atMatches = useMemo(
-    () => (atRaw === null ? [] : entries.filter((e) => e.name.toLowerCase().includes(atFrag)).slice(0, 10)),
-    [atRaw, atFrag, entries],
+    () => {
+      if (atRaw === null) return [];
+      const local = entries.filter((e) => e.name.toLowerCase().includes(atFrag));
+      const seen = new Set(local.map((e) => e.name));
+      const searched = searchEntries.filter((e) => {
+        const basename = e.name.split("/").pop()?.toLowerCase() ?? "";
+        return basename.includes(atFrag) && !seen.has(e.name);
+      });
+      return [...local, ...searched].slice(0, 10);
+    },
+    [atRaw, atFrag, entries, searchEntries],
   );
 
   // --- which menu (if any) is open --- (slash command names win; then slash
@@ -381,8 +421,8 @@ export function Composer({
     }
   };
 
-  // Non-image drops (PDFs, docs): the browser hands us bytes, not a path, so the
-  // kernel stores them and we reference the saved path — attached, not ignored.
+  // Non-image pastes (PDFs, docs): the clipboard hands us bytes, not a path, so
+  // the kernel stores them and we reference the saved path — attached, not ignored.
   const attachOtherFiles = async (files: File[]) => {
     const others = files.filter((f) => !f.type.startsWith("image/"));
     if (others.length === 0) return;
@@ -404,6 +444,30 @@ export function Composer({
     void attachImageFiles(files);
     void attachOtherFiles(files);
   };
+
+  // OS file drops arrive as absolute paths through the native bridge (the webview
+  // withholds them from the HTML drop event); the kernel resolves each into a
+  // workspace @reference or a stored attachment.
+  const attachDroppedPaths = async (paths: string[]) => {
+    setDragOver(false);
+    for (const path of paths) {
+      setPendingPaste((n) => n + 1);
+      try {
+        const item = await app.AttachDropped(path);
+        if (item.kind === "workspace") {
+          addWorkspaceReference({ path: item.path, isDir: item.isDir });
+        } else {
+          setAttachments((prev) => [...prev, { path: item.path, previewUrl: item.previewUrl }]);
+        }
+      } catch {
+        // non-fatal: a failed drop attach must not block normal text input
+      } finally {
+        setPendingPaste((n) => Math.max(0, n - 1));
+      }
+    }
+  };
+
+  useEffect(() => onFilesDropped((paths) => void attachDroppedPaths(paths)), []);
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData.files);
@@ -453,11 +517,9 @@ export function Composer({
       return;
     }
 
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
-    e.preventDefault();
-    setDragOver(false);
-    attachFiles(files);
+    // OS file drops deliver no usable bytes/paths here; the native bridge
+    // (onFilesDropped → AttachDropped) handles them. Just clear the hover state.
+    if (hasFileDrag(e.dataTransfer)) setDragOver(false);
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -664,7 +726,7 @@ export function Composer({
   const composerCardStyle = composerHeight === null ? undefined : ({ "--composer-height": `${composerHeight}px` } as CSSProperties);
 
   return (
-    <div className="composer-wrap">
+    <div className="composer-wrap" style={{ "--wails-drop-target": "drop" } as CSSProperties}>
       {workspaceMenuOpen && cwd && (
         <div className="workspace-switcher" ref={workspaceMenuRef}>
           <label className="workspace-switcher__search">
@@ -775,9 +837,11 @@ export function Composer({
                       <Eye size={14} />
                     </button>
                   </Tooltip>
-                  <button type="button" onClick={() => expandPastedBlock(block)}>
-                    {t("composer.pastedExpand")}
-                  </button>
+                  <Tooltip label={t("composer.pastedExpand")}>
+                    <button type="button" onClick={() => expandPastedBlock(block)}>
+                      {t("composer.pastedExpand")}
+                    </button>
+                  </Tooltip>
                   <Tooltip label={t("composer.pastedRemove")}>
                     <button type="button" onClick={() => removePastedBlock(block)}>
                       <Trash2 size={14} />
@@ -865,14 +929,16 @@ export function Composer({
               </Tooltip>
             </div>
           )}
-          <button
-            className={`composer__mode composer__mode--${mode}`}
-            onClick={onCycleMode}
-          >
-            <span className="composer__mode-dot" />
-            {mode === "yolo" ? t("composer.modeYolo") : mode === "plan" ? t("composer.modePlan") : t("composer.modeNormal")}
-            <span className="composer__mode-hint">{t("composer.modeHint")}</span>
-          </button>
+          <Tooltip label={t("composer.modeTitle")}>
+            <button
+              className={`composer__mode composer__mode--${mode}`}
+              onClick={onCycleMode}
+            >
+              <span className="composer__mode-dot" />
+              {mode === "yolo" ? t("composer.modeYolo") : mode === "plan" ? t("composer.modePlan") : t("composer.modeNormal")}
+              <span className="composer__mode-hint">{t("composer.modeHint")}</span>
+            </button>
+          </Tooltip>
         </div>
       </div>
     </div>

@@ -59,6 +59,47 @@ func TestCustomProxyHonorsNoProxy(t *testing.T) {
 	}
 }
 
+func TestDirectHostsBypassProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+	t.Setenv("NO_PROXY", "")
+	pf, err := proxyFunc(ProxySpec{Mode: "auto", DirectHosts: []string{"token-plan-cn.xiaomimimo.com"}})
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+
+	got, err := pf(&http.Request{URL: mustURL("https://token-plan-cn.xiaomimimo.com/v1/chat")})
+	if err != nil {
+		t.Fatalf("direct-host lookup: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("a direct host should bypass the proxy, got %s", got)
+	}
+
+	other, err := pf(&http.Request{URL: mustURL("https://example.com/x")})
+	if err != nil {
+		t.Fatalf("other lookup: %v", err)
+	}
+	if other == nil || other.Host != "proxy.example.com:8080" {
+		t.Fatalf("non-direct host should still use the env proxy, got %v", other)
+	}
+}
+
+func TestNoDirectHostsKeepsEveryoneProxied(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+	t.Setenv("NO_PROXY", "")
+	pf, err := proxyFunc(ProxySpec{Mode: "env"}) // no DirectHosts → nothing special-cased
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	got, err := pf(&http.Request{URL: mustURL("https://token-plan-cn.xiaomimimo.com/v1/chat")})
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if got == nil || got.Host != "proxy.example.com:8080" {
+		t.Fatalf("without DirectHosts the host must go through the proxy, got %v", got)
+	}
+}
+
 func TestOffProxyDisablesProxy(t *testing.T) {
 	pf, err := proxyFunc(ProxySpec{Mode: "off"})
 	if err != nil {

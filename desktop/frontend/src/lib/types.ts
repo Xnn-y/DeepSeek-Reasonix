@@ -160,6 +160,13 @@ export interface DirEntry {
   isDir: boolean;
 }
 
+export interface DroppedItem {
+  kind: "workspace" | "attachment";
+  path: string;
+  isDir?: boolean;
+  previewUrl?: string;
+}
+
 export interface FilePreview {
   path: string;
   body: string;
@@ -195,18 +202,36 @@ export interface ComposerInsertRequest {
 export interface ServerView {
   name: string;
   transport: string;
-  status: "connected" | "failed" | "disabled";
+  status: "connected" | "deferred" | "failed" | "initializing" | "disabled";
+  builtIn?: boolean;
+  configured?: boolean;
+  autoStart: boolean;
+  tier?: "lazy" | "background" | "eager" | string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  envKeys?: string[];
   tools: number;
   prompts: number;
   resources: number;
   error?: string;
   toolList?: MCPToolView[];
+  authStatus?: "none" | "possible" | "required" | string;
+  authUrl?: string;
+  authConfigured?: boolean;
 }
 export interface MCPToolView {
   name: string;
   description: string;
 }
 export interface SkillView {
+  name: string;
+  description: string;
+  scope: string;
+  runAs: string;
+  enabled: boolean;
+}
+export interface SkillRootSkillView {
   name: string;
   description: string;
   scope: string;
@@ -219,6 +244,7 @@ export interface SkillRootView {
   status: string;
   configured: boolean;
   skills: number;
+  skillItems?: SkillRootSkillView[];
   warning?: string;
 }
 export interface CapabilitiesView {
@@ -232,7 +258,8 @@ export interface MCPServerInput {
   command: string;
   args: string[];
   url: string;
-  env: Record<string, string>;
+  env?: Record<string, string> | null;
+  tier: string;
 }
 
 export interface ModelInfo {

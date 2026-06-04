@@ -12,6 +12,7 @@ import type {
   CommandInfo,
   ContextInfo,
   DirEntry,
+  DroppedItem,
   EffortInfo,
   FilePreview,
   HistoryMessage,
@@ -42,9 +43,12 @@ export interface AppBindings {
   Submit(input: string): Promise<void>;
   SubmitDisplay(display: string, input: string): Promise<void>;
   Cancel(): Promise<void>;
-  Approve(id: string, allow: boolean, session: boolean): Promise<void>;
+  Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
+  // SetMode applies plan/yolo/normal gating atomically (one IPC, no half-applied
+  // window); prefer it over sequencing SetPlanMode + SetBypass from the UI.
+  SetMode(mode: string): Promise<void>;
   Compact(): Promise<void>;
   NewSession(): Promise<void>;
   History(): Promise<HistoryMessage[]>;
@@ -81,23 +85,31 @@ export interface AppBindings {
   // Retry reconnects a configured server that failed (config untouched).
   Capabilities(): Promise<CapabilitiesView>;
   AddMCPServer(input: MCPServerInput): Promise<number>;
+  UpdateMCPServer(name: string, input: MCPServerInput): Promise<void>;
   RemoveMCPServer(name: string): Promise<void>;
   RetryMCPServer(name: string): Promise<void>;
+  ClearMCPServerAuthentication(name: string): Promise<void>;
   PickSkillFolder(): Promise<string>;
   AddSkillPath(path: string): Promise<void>;
   RemoveSkillPath(path: string): Promise<void>;
   RefreshSkills(): Promise<void>;
+  SetSkillEnabled(name: string, enabled: boolean): Promise<void>;
   // SetMCPServerEnabled is the per-session connector toggle (on reconnects, off
   // disconnects; config untouched).
   SetMCPServerEnabled(name: string, enabled: boolean): Promise<void>;
+  SetMCPServerTier(name: string, tier: string): Promise<void>;
   SlashArgs(input: string): Promise<SlashArgsResult>;
   ListDir(rel: string): Promise<DirEntry[]>;
+  SearchFileRefs(query: string): Promise<DirEntry[]>;
   ReadFile(rel: string): Promise<FilePreview>;
   WorkspaceChanges(): Promise<WorkspaceChangesView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   SavePastedImage(dataUrl: string): Promise<string>;
   SavePastedFile(name: string, dataUrl: string): Promise<string>;
+  // AttachDropped resolves an OS-dropped absolute path (from the native file-drop
+  // bridge) into a composer context entry — a workspace ref or a stored attachment.
+  AttachDropped(path: string): Promise<DroppedItem>;
   AttachmentDataURL(path: string): Promise<string>;
   Models(): Promise<ModelInfo[]>;
   SetModel(name: string): Promise<void>;
@@ -143,6 +155,10 @@ export interface AppBindings {
 interface WailsRuntime {
   EventsOn(name: string, cb: (...data: unknown[]) => void): () => void;
   BrowserOpenURL(url: string): void;
+  // Native OS file drop (desktop only); useDropTarget gates delivery to elements
+  // carrying the --wails-drop-target CSS property. Absent in the browser dev mock.
+  OnFileDrop?(cb: (x: number, y: number, paths: string[]) => void, useDropTarget: boolean): void;
+  OnFileDropOff?(): void;
 }
 
 declare global {
@@ -188,6 +204,18 @@ export function onUpdaterProgress(cb: (p: UpdateProgress) => void): () => void {
   return () => {
     updaterListeners.delete(cb);
   };
+}
+
+// onFilesDropped subscribes to native OS file drops landing on the composer (the
+// --wails-drop-target element); the callback gets the dropped files' absolute
+// paths. No-op in the browser dev mock, where the runtime is absent.
+export function onFilesDropped(cb: (paths: string[]) => void): () => void {
+  const rt = typeof window !== "undefined" ? window.runtime : undefined;
+  if (!rt?.OnFileDrop) return () => {};
+  rt.OnFileDrop((_x, _y, paths) => {
+    if (Array.isArray(paths) && paths.length > 0) cb(paths);
+  }, true);
+  return () => rt.OnFileDropOff?.();
 }
 
 // onReady subscribes to the agent:ready event fired when boot.Build completes.
@@ -251,6 +279,8 @@ function delay(ms: number): Promise<void> {
 
 function makeMockApp(): AppBindings {
   let cancelled = false;
+  let pendingAskPreview = false;
+  let pendingApprovalPreview = false;
   let cwd = "~/projects/reasonix"; // mutable so PickWorkspace is visible in dev
   let workspaces = ["~/projects/reasonix", "~/projects/blade", "~/projects/deepseek-forge", "~/projects/cc-switch-light", "~/projects/SuperRig"];
   let mockEffort = "auto";
@@ -261,10 +291,14 @@ function makeMockApp(): AppBindings {
     {
       name: "codegraph",
       transport: "stdio",
-      status: "connected",
-      tools: 4,
+      status: "disabled",
+      builtIn: true,
+      configured: true,
+      autoStart: false,
+      tier: "lazy",
+      tools: 0,
       prompts: 0,
-      resources: 1,
+      resources: 0,
       toolList: [
         { name: "search", description: "Search symbols, files, and text in the workspace." },
         { name: "context", description: "Fetch surrounding source context for a symbol or file." },
@@ -272,19 +306,61 @@ function makeMockApp(): AppBindings {
         { name: "node", description: "Inspect a specific graph node." },
       ],
     },
-    { name: "github", transport: "stdio", status: "connected", tools: 12, prompts: 2, resources: 0 },
-    { name: "linear", transport: "http", status: "connected", tools: 8, prompts: 0, resources: 0 },
-    { name: "figma", transport: "http", status: "failed", tools: 0, prompts: 0, resources: 0, error: "connect: 401 unauthorized" },
+    { name: "github", transport: "stdio", status: "connected", configured: true, autoStart: true, tier: "lazy", command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], tools: 12, prompts: 2, resources: 0 },
+    {
+      name: "linear",
+      transport: "http",
+      status: "deferred",
+      configured: true,
+      autoStart: true,
+      tier: "lazy",
+      url: "https://mcp.linear.app/mcp",
+      authStatus: "possible",
+      authUrl: "https://mcp.linear.app/mcp",
+      tools: 8,
+      prompts: 0,
+      resources: 0,
+      toolList: [
+        { name: "list_issues", description: "List and filter Linear issues." },
+        { name: "get_issue", description: "Fetch a Linear issue by id or key." },
+        { name: "create_issue", description: "Create a Linear issue." },
+        { name: "update_issue", description: "Update status, assignee, priority, or labels." },
+        { name: "list_projects", description: "List Linear projects." },
+        { name: "get_project", description: "Fetch project details." },
+        { name: "list_teams", description: "List Linear teams." },
+        { name: "search", description: "Search Linear workspace objects." },
+      ],
+    },
+    { name: "figma", transport: "http", status: "failed", configured: true, autoStart: true, tier: "lazy", url: "https://mcp.figma.com/mcp", authStatus: "required", authUrl: "https://mcp.figma.com/mcp", tools: 0, prompts: 0, resources: 0, error: "connect: 401 unauthorized" },
   ];
   const capSkills: SkillView[] = [
-    { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent" },
-    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline" },
-    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline" },
+    { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent", enabled: true },
+    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline", enabled: false },
+    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline", enabled: true },
   ];
   let capSkillRoots: SkillRootView[] = [
     { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, skills: 0 },
-    { dir: "~/my-skills", scope: "custom", priority: 5, status: "ok", configured: true, skills: 1 },
-    { dir: "~/.reasonix/skills", scope: "global", priority: 6, status: "ok", configured: false, skills: 2 },
+    {
+      dir: "~/my-skills",
+      scope: "custom",
+      priority: 5,
+      status: "ok",
+      configured: true,
+      skills: 1,
+      skillItems: [{ name: "review", description: "Review the staged diff", scope: "custom", runAs: "inline" }],
+    },
+    {
+      dir: "~/.reasonix/skills",
+      scope: "global",
+      priority: 6,
+      status: "ok",
+      configured: false,
+      skills: 2,
+      skillItems: [
+        { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "global", runAs: "subagent" },
+        { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "global", runAs: "inline" },
+      ],
+    },
   ];
   const mockSwitchWorkspace = async (path: string) => {
     cwd = path || "~";
@@ -323,6 +399,73 @@ function makeMockApp(): AppBindings {
     async Submit(input) {
       cancelled = false;
       emit({ kind: "turn_started" });
+      const trimmedInput = input.trim().toLowerCase();
+      if (trimmedInput === "/approve-preview" || trimmedInput === "approve preview" || trimmedInput === "approve预览") {
+        pendingApprovalPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-approval-preview",
+            tool: "bash",
+            subject: "npm run build\n\n需要运行构建命令来验证前端产物和样式打包是否正常。",
+          },
+        });
+        return;
+      }
+      if (
+        trimmedInput === "/plan-approve-preview" ||
+        trimmedInput === "plan approve preview" ||
+        trimmedInput === "plan approve预览"
+      ) {
+        pendingApprovalPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-plan-approval-preview",
+            tool: "exit_plan_mode",
+            subject: "",
+          },
+        });
+        return;
+      }
+      if (trimmedInput === "/ask-preview" || trimmedInput === "ask preview" || trimmedInput === "ask预览") {
+        pendingAskPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "ask_request",
+          ask: {
+            id: "mock-ask-preview",
+            questions: [
+              {
+                id: "q1",
+                header: "处理方向",
+                prompt: "git pull 的冲突你想怎么处理？",
+                options: [
+                  { label: "git stash 后 pull", description: "用 git stash 暂存本地修改，拉取最新代码后再恢复" },
+                  { label: "丢弃本地修改后 pull", description: "放弃本地所有修改，强制与远端同步" },
+                  { label: "另建分支保存改动", description: "先创建分支把本地改动保存起来，再拉取主分支" },
+                ],
+              },
+              {
+                id: "q2",
+                header: "Reasonix 构建",
+                prompt: "对于 reasonix 二进制缺失的问题，你想怎么做？",
+                options: [
+                  { label: "先查文档", description: "查看 README / 构建文档来确定正确的构建命令" },
+                  { label: "看构建配置", description: "查看 desktop/wails.json 与 main.go 来推断入口" },
+                  { label: "我先帮你尝试构建", description: "先处理 git 冲突，然后尝试本地构建并汇报结果" },
+                ],
+              },
+            ],
+          },
+        });
+        return;
+      }
       // Simulate the server's pre-first-token latency so the deferred user bubble
       // and the "un-send on Esc before any reply" path are observable in browser
       // dev. Bail if cancelled during the wait — nothing was streamed yet.
@@ -374,9 +517,27 @@ function makeMockApp(): AppBindings {
       cancelled = true;
       emit({ kind: "turn_done" });
     },
-    async Approve() {},
-    async AnswerQuestion() {},
+    async Approve(_id, allow, session, persist) {
+      if (!pendingApprovalPreview) return;
+      pendingApprovalPreview = false;
+      const suffix = persist ? "persisted" : session ? "allowed for session" : "allowed once";
+      emit({
+        kind: "message",
+        text: `approval preview answered: ${allow ? suffix : "denied"}`,
+      });
+      emit({ kind: "turn_done" });
+    },
+    async AnswerQuestion(_id, answers) {
+      if (!pendingAskPreview) return;
+      pendingAskPreview = false;
+      const summary = answers
+        .map((answer) => `${answer.questionId}: ${(answer.selected ?? []).join(", ") || "(no answer)"}`)
+        .join("\n");
+      emit({ kind: "message", text: `ask preview answered:\n\n${summary}` });
+      emit({ kind: "turn_done" });
+    },
     async SetPlanMode() {},
+    async SetMode() {},
     async Compact() {},
     async NewSession() {},
     async Checkpoints() {
@@ -480,6 +641,12 @@ function makeMockApp(): AppBindings {
         name: input.name,
         transport: input.transport,
         status: "connected",
+        configured: true,
+        autoStart: true,
+        tier: input.tier || "lazy",
+        command: input.command,
+        args: input.args,
+        url: input.url,
         tools,
         prompts: 0,
         resources: 0,
@@ -490,12 +657,49 @@ function makeMockApp(): AppBindings {
       });
       return tools;
     },
+    async UpdateMCPServer(name: string, input: MCPServerInput) {
+      capServers = capServers.map((s) => {
+        if (s.name !== name) return s;
+        const connected = s.status === "connected" || s.status === "failed" || input.tier !== "lazy";
+        const nextStatus = s.status === "disabled" ? "disabled" : connected ? "connected" : "deferred";
+        const nextTools = nextStatus === "connected" ? s.tools || (input.transport === "stdio" ? 3 : 5) : 0;
+        return {
+          ...s,
+          transport: input.transport,
+          status: nextStatus,
+          tier: input.tier || "lazy",
+          command: input.transport === "stdio" ? input.command : "",
+          args: input.transport === "stdio" ? input.args : [],
+          url: input.transport === "stdio" ? "" : input.url,
+          envKeys: input.env ? Object.keys(input.env).sort() : s.envKeys,
+          tools: nextTools,
+          error: undefined,
+          authStatus: nextStatus !== "connected" && input.transport !== "stdio" ? "possible" : undefined,
+          authUrl: nextStatus !== "connected" && input.transport !== "stdio" ? input.url : undefined,
+        };
+      });
+    },
     async RemoveMCPServer(name: string) {
       capServers = capServers.filter((s) => s.name !== name);
     },
     async RetryMCPServer(name: string) {
       capServers = capServers.map((s) =>
-        s.name === name ? { ...s, status: "connected", tools: s.tools || 4, error: undefined } : s,
+        s.name === name ? { ...s, status: "connected", tools: s.tools || 4, error: undefined, authStatus: undefined, authUrl: undefined } : s,
+      );
+    },
+    async ClearMCPServerAuthentication(name: string) {
+      capServers = capServers.map((s) =>
+        s.name === name
+          ? {
+              ...s,
+              status: s.tier === "background" || s.tier === "eager" ? "initializing" : "deferred",
+              tools: 0,
+              error: undefined,
+              authStatus: s.transport !== "stdio" ? "possible" : undefined,
+              authUrl: s.transport !== "stdio" ? s.url : undefined,
+              authConfigured: undefined,
+            }
+          : s,
       );
     },
     async PickSkillFolder() {
@@ -504,10 +708,18 @@ function makeMockApp(): AppBindings {
     async AddSkillPath(path: string) {
       const dir = path.trim() || "~/my-skills";
       if (!capSkillRoots.some((r) => r.scope === "custom" && r.dir === dir)) {
-        capSkillRoots.push({ dir, scope: "custom", priority: capSkillRoots.length + 1, status: "ok", configured: true, skills: 1 });
+        capSkillRoots.push({
+          dir,
+          scope: "custom",
+          priority: capSkillRoots.length + 1,
+          status: "ok",
+          configured: true,
+          skills: 1,
+          skillItems: [{ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" }],
+        });
       }
       if (!capSkills.some((s) => s.name === "local-dev")) {
-        capSkills.push({ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" });
+        capSkills.push({ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline", enabled: true });
       }
     },
     async RemoveSkillPath(path: string) {
@@ -518,12 +730,32 @@ function makeMockApp(): AppBindings {
       }
     },
     async RefreshSkills() {},
+    async SetSkillEnabled(name: string, enabled: boolean) {
+      const skill = capSkills.find((s) => s.name === name);
+      if (skill) skill.enabled = enabled;
+    },
     async SetMCPServerEnabled(name: string, enabled: boolean) {
       capServers = capServers.map((s) =>
         s.name === name
-          ? { ...s, status: enabled ? "connected" : "disabled", tools: enabled ? s.tools || 4 : 0, error: undefined }
+          ? {
+              ...s,
+              status: enabled ? "connected" : "disabled",
+              autoStart: s.builtIn ? enabled : s.autoStart,
+              tools: enabled ? s.tools || 4 : 0,
+              error: undefined,
+              authStatus: !enabled && s.transport !== "stdio" ? "possible" : undefined,
+              authUrl: !enabled && s.transport !== "stdio" ? s.url : undefined,
+            }
           : s,
       );
+    },
+    async SetMCPServerTier(name: string, tier: string) {
+      capServers = capServers.map((s) => {
+        if (s.name !== name) return s;
+        if (tier === "lazy") return { ...s, tier, autoStart: true };
+        const tools = s.tools || (s.transport === "stdio" ? 3 : 5);
+        return { ...s, tier, autoStart: true, status: "connected", tools, error: undefined, authStatus: undefined, authUrl: undefined };
+      });
     },
     async SlashArgs(input: string) {
       // Mirror a slice of the real arg hints so the menu is exercisable in browser dev.
@@ -534,6 +766,8 @@ function makeMockApp(): AppBindings {
         "/skill": [
           { label: "list", insert: "list", hint: "list skills" },
           { label: "show", insert: "show ", hint: "show a skill's body", descend: true },
+          { label: "enable", insert: "enable ", hint: "enable a disabled skill", descend: true },
+          { label: "disable", insert: "disable ", hint: "disable an enabled skill", descend: true },
           { label: "new", insert: "new ", hint: "scaffold a new skill" },
           { label: "paths", insert: "paths", hint: "show discovery paths" },
         ],
@@ -574,6 +808,12 @@ function makeMockApp(): AppBindings {
         ];
       }
       return [{ name: "file.go", isDir: false }];
+    },
+    async SearchFileRefs(query: string) {
+      const q = query.toLowerCase();
+      return ["desktop/frontend/src/lib/bridge.ts", "frontend/wailsjs/runtime/runtime.js", "internal/control/refs.go"]
+        .filter((path) => path.split("/").pop()?.toLowerCase().includes(q))
+        .map((name) => ({ name, isDir: false }));
     },
     async ReadFile(rel: string) {
       const samples: Record<string, string> = {
@@ -618,6 +858,10 @@ function makeMockApp(): AppBindings {
     },
     async SavePastedFile(name: string, _dataUrl: string) {
       return `.reasonix/attachments/mock-${name}`;
+    },
+    async AttachDropped(path: string) {
+      const name = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+      return { kind: "attachment" as const, path: `.reasonix/attachments/mock-${name}` };
     },
     async AttachmentDataURL(_path: string) {
       return "data:image/png;base64,iVBORw0KGgo=";

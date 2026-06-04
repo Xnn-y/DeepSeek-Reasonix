@@ -435,17 +435,20 @@ func (a *Agent) finalReadinessFailure() string {
 	if a.evidence == nil {
 		return ""
 	}
+	var missing []string
+	if incomplete, hasTodos := a.evidence.IncompleteLatestTodos(); hasTodos && len(incomplete) > 0 {
+		missing = append(missing, finalReadinessIncompleteTodos(incomplete))
+	}
 	writer, hasWriter := a.evidence.LatestSuccessfulWriterIndex()
 	if !hasWriter {
-		return ""
+		return strings.Join(missing, "; ")
 	}
 	hasProjectChecks := len(a.projectChecks) > 0
 	hasTodoReceipt := a.evidence.HasSuccessfulTodoWrite()
-	if !hasProjectChecks && !hasTodoReceipt {
+	if !hasProjectChecks && !hasTodoReceipt && len(missing) == 0 {
 		return ""
 	}
 
-	var missing []string
 	for _, check := range a.projectChecks {
 		command := strings.TrimSpace(check.Command)
 		if command == "" {
@@ -462,6 +465,18 @@ func (a *Agent) finalReadinessFailure() string {
 		return ""
 	}
 	return strings.Join(missing, "; ")
+}
+
+func finalReadinessIncompleteTodos(items []evidence.TodoStepMatch) string {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		label := strings.TrimSpace(item.Content)
+		if label == "" {
+			label = fmt.Sprintf("todo %d", item.Index)
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", label, item.Status))
+	}
+	return "latest successful todo_write still has incomplete items: " + strings.Join(parts, ", ")
 }
 
 func finalReadinessCheckSource(check instruction.VerifyCheck) string {
@@ -858,7 +873,15 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 		a.hooks.PostToolUse(ctx, call.Name, json.RawMessage(call.Arguments), result)
 	}
 	if err != nil {
-		body, truncMsg := truncateToolOutput(fmt.Sprintf("error: %v\n%s", err, result))
+		detail := result
+		// Malformed-args failures are a transient model JSON glitch (e.g. options
+		// written as ["a":"b"] → "invalid character ':' after array element"). The
+		// args can't be safely re-parsed, but echoing the tool's schema makes the
+		// retry land valid instead of repeating the same broken shape.
+		if !json.Valid([]byte(call.Arguments)) {
+			detail = strings.TrimRight(detail, "\n") + "\nThe arguments were not valid JSON. Re-emit them exactly per this schema:\n" + string(t.Schema())
+		}
+		body, truncMsg := truncateToolOutput(fmt.Sprintf("error: %v\n%s", err, detail))
 		return toolOutcome{output: body, errMsg: firstLine(err.Error()), truncated: truncMsg != "", truncMsg: truncMsg}
 	}
 	// A foreground `task` sub-agent just finished — its result is the final answer.

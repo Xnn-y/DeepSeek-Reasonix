@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -127,6 +129,59 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 	if !strings.Contains(sys, "projskill") || !strings.Contains(sys, "explore") {
 		t.Fatalf("skill names missing from index:\n%s", sys)
+	}
+}
+
+func TestBuildOmitsDisabledSkillsFromPromptAndRuntimeList(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Chdir(dir)
+	writeFile(t, dir, "reasonix.toml", `
+default_model = "test-model"
+
+[codegraph]
+enabled = false
+
+[agent]
+system_prompt = "BASE"
+
+[skills]
+disabled_skills = ["projskill", "review"]
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+	writeFile(t, dir, ".reasonix/skills/projskill.md", "---\ndescription: a project skill\n---\nplaybook")
+
+	ctrl, err := Build(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer ctrl.Close()
+
+	for _, s := range ctrl.Skills() {
+		if s.Name == "projskill" || s.Name == "review" {
+			t.Fatalf("disabled skill %q should not be executable: %v", s.Name, ctrl.Skills())
+		}
+	}
+	var allHasProj bool
+	for _, s := range ctrl.AllSkills() {
+		if s.Name == "projskill" {
+			allHasProj = true
+		}
+	}
+	if !allHasProj {
+		t.Fatalf("AllSkills should include disabled skills for management: %v", ctrl.AllSkills())
+	}
+	sys := systemMessage(ctrl.History())
+	if strings.Contains(sys, "projskill") || strings.Contains(sys, "- review ") {
+		t.Fatalf("disabled skill names should be omitted from system prompt:\n%s", sys)
 	}
 }
 
@@ -284,6 +339,83 @@ func writeFile(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := writeFileRaw(dir, name, body); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestBuildMigratesLegacyConfigEndToEnd drives the real boot path: a v0.x
+// ~/.reasonix/config.json with no v1+ config present must be imported during
+// Build — config written, key pinned into the env, and the user told via a notice.
+func TestBuildMigratesLegacyConfigEndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)                               // os.UserHomeDir on Windows
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config")) // os.UserConfigDir on Linux
+	t.Setenv("AppData", filepath.Join(home, "AppData"))         // os.UserConfigDir on Windows
+	t.Setenv("DEEPSEEK_API_KEY", "")                            // track for cleanup; migration os.Setenv's it live
+
+	proj := t.TempDir()
+	t.Chdir(proj)
+	// codegraph off keeps Build offline; it merges over the migrated user config
+	// without dropping the migrated plugins.
+	writeFile(t, proj, "reasonix.toml", "[codegraph]\nenabled = false\n")
+	writeFile(t, filepath.Join(home, ".reasonix"), "config.json",
+		`{"apiKey":"sk-e2e","lang":"zh","mcpServers":{"fs":{"command":"npx","args":["-y","server-fs"]}}}`)
+	writeFile(t, filepath.Join(home, ".reasonix", "sessions"), "chat-1.events.jsonl",
+		`{"type":"user.message","id":1,"ts":"t","turn":0,"text":"hello from v0.x"}`+"\n"+
+			`{"type":"model.final","id":2,"ts":"t","turn":0,"content":"hi","toolCalls":[],"usage":{},"costUsd":0}`+"\n")
+
+	var notices []string
+	sink := event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e.Text)
+		}
+	})
+
+	ctrl, err := Build(context.Background(), Options{Sink: sink})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer ctrl.Close()
+
+	migrated := false
+	for _, n := range notices {
+		if strings.Contains(n, "migrated your previous configuration") {
+			migrated = true
+		}
+	}
+	if !migrated {
+		t.Fatalf("no migration notice emitted; got %v", notices)
+	}
+
+	dest := config.UserConfigPath()
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("v2 config not written to %s: %v", dest, err)
+	}
+	if !strings.Contains(string(data), `name    = "fs"`) || !strings.Contains(string(data), `language      = "zh"`) {
+		t.Errorf("migrated config missing plugin/lang:\n%s", data)
+	}
+
+	if got := os.Getenv("DEEPSEEK_API_KEY"); got != "sk-e2e" {
+		t.Errorf("DEEPSEEK_API_KEY not pinned into env after migration: %q", got)
+	}
+
+	if data, err := os.ReadFile(filepath.Join(home, ".env")); err != nil || !strings.Contains(string(data), "DEEPSEEK_API_KEY=sk-e2e") {
+		t.Errorf("~/.env missing migrated key: %q (err %v)", data, err)
+	}
+
+	sessionImported := false
+	for _, n := range notices {
+		if strings.Contains(n, "imported") && strings.Contains(n, "past session") {
+			sessionImported = true
+		}
+	}
+	if !sessionImported {
+		t.Errorf("no session-import notice emitted; got %v", notices)
+	}
+	migratedSession := filepath.Join(config.SessionDir(), "chat-1.jsonl")
+	if _, err := os.Stat(migratedSession); err != nil {
+		t.Errorf("legacy session not imported to %s: %v", migratedSession, err)
 	}
 }
 
@@ -460,6 +592,72 @@ env = { GO_WANT_HELPER_PROCESS = "1" }
 	}
 }
 
+func TestBuildColdCodegraphStartsInBackground(t *testing.T) {
+	isolateConfigHome(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	launcher := writeCodegraphHelper(t, dir)
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+
+	writeFile(t, dir, "reasonix.toml", fmt.Sprintf(`
+default_model = "test-model"
+
+[codegraph]
+enabled = true
+path = %q
+tier = "background"
+
+[agent]
+system_prompt = "BASE"
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`, launcher))
+
+	var notices []event.Event
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ctrl, err := Build(ctx, Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.Notice {
+				notices = append(notices, e)
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer ctrl.Close()
+
+	if got := ctrl.Host().Failures(); len(got) != 0 {
+		t.Fatalf("Host.Failures() = %+v, want empty for cold built-in codegraph background startup", got)
+	}
+	codegraphDir := filepath.Join(dir, ".codegraph")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(codegraphDir); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("cold codegraph init did not create .codegraph/: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	foundNotice := false
+	for _, n := range notices {
+		if strings.Contains(n.Text, "preparing code-intelligence tools in the background") {
+			foundNotice = true
+			break
+		}
+	}
+	if !foundNotice {
+		t.Fatalf("missing background warmup notice; got %+v", notices)
+	}
+}
+
 // TestBuildAutoDemoteFromStats proves the Phase 5 telemetry → Phase 4 tier
 // bridge: three consecutive over-budget startup samples must demote an
 // eager-tier plugin to lazy at the *next* boot, so the user pays for a slow
@@ -605,4 +803,78 @@ func TestHelperProcess(t *testing.T) {
 		b, _ := json.Marshal(resp)
 		os.Stdout.Write(append(b, '\n'))
 	}
+}
+
+func writeCodegraphHelper(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "codegraph-helper")
+	if runtime.GOOS == "windows" {
+		path += ".exe"
+	}
+	src := filepath.Join(dir, "codegraph-helper.go")
+	if err := os.WriteFile(src, []byte(`package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	if len(os.Args) >= 3 && os.Args[1] == "init" {
+		_ = os.MkdirAll(filepath.Join(os.Args[2], ".codegraph"), 0o755)
+		return
+	}
+
+	in := bufio.NewReader(os.Stdin)
+	for {
+		line, err := in.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		var req struct {
+			ID     *int            `+"`json:\"id\"`"+`
+			Method string          `+"`json:\"method\"`"+`
+			Params json.RawMessage `+"`json:\"params\"`"+`
+		}
+		if err := json.Unmarshal(line, &req); err != nil || req.ID == nil {
+			continue
+		}
+
+		var result any
+		switch req.Method {
+		case "initialize":
+			result = map[string]any{
+				"protocolVersion": "2024-11-05",
+				"serverInfo":      map[string]any{"name": "codegraph", "version": "0"},
+				"capabilities":    map[string]any{},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []map[string]any{{
+				"name":        "search",
+				"description": "Search symbols.",
+				"inputSchema": map[string]any{"type": "object"},
+			}}}
+		}
+
+		resp := map[string]any{"jsonrpc": "2.0", "id": *req.ID, "result": result}
+		b, _ := json.Marshal(resp)
+		_, _ = os.Stdout.Write(append(b, '\n'))
+	}
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "build", "-o", path, src)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build codegraph helper: %v\n%s", err, out)
+	}
+	return path
 }
