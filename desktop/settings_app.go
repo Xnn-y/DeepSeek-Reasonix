@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -109,7 +110,6 @@ func (a *App) Settings() SettingsView {
 			Sandbox: SandboxView{Bash: "enforce", AllowWrite: []string{}},
 		}
 	}
-	ctrl := a.activeCtrl()
 	bash := cfg.Sandbox.Bash
 	if bash == "" {
 		bash = "enforce"
@@ -142,8 +142,8 @@ func (a *App) Settings() SettingsView {
 		},
 		Agent:         AgentView{Temperature: cfg.Agent.Temperature, MaxSteps: cfg.Agent.MaxSteps, SystemPrompt: cfg.Agent.SystemPrompt},
 		ConfigPath:    config.SourcePath(),
-		ProviderKinds: nonNil(provider.Kinds()),
-		Bypass:        ctrl != nil && ctrl.Bypass(),
+		ProviderKinds: provider.Kinds(),
+		Bypass:        a.ctrl != nil && a.ctrl.Bypass(),
 	}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
@@ -194,19 +194,14 @@ func (a *App) rebuild() error {
 	if a.ctx == nil {
 		return nil
 	}
-	tab := a.activeTab()
-	if tab == nil {
-		return fmt.Errorf("no active tab")
-	}
 	var carried []provider.Message
 	prevPath := ""
-	if tab.Ctrl != nil {
-		prevPath = tab.Ctrl.SessionPath()
-		_ = tab.Ctrl.Snapshot()
-		carried = tab.Ctrl.History()
-		tab.Ctrl.Close()
+	if a.ctrl != nil {
+		prevPath = a.ctrl.SessionPath()
+		_ = a.ctrl.Snapshot()
+		carried = a.ctrl.History()
 	}
-	model := tab.model
+	model := a.model
 	if cfg, err := config.Load(); err == nil {
 		if _, ok := cfg.ResolveModel(model); !ok {
 			model = cfg.DefaultModel
@@ -215,23 +210,19 @@ func (a *App) rebuild() error {
 			}
 		}
 	}
-	ctrl, err := boot.Build(a.ctx, boot.Options{
-		Model: model, RequireKey: false,
-		Sink:          tab.sink,
-		WorkspaceRoot: tab.WorkspaceRoot,
-	})
+	ctrl, err := boot.Build(a.ctx, boot.Options{Model: model, RequireKey: false, Sink: a.sink, Stderr: io.Discard})
 	if err != nil {
-		a.mu.Lock()
-		tab.StartupErr = err.Error()
-		a.mu.Unlock()
+		a.startupErr = err.Error()
 		return err
 	}
-	a.mu.Lock()
-	tab.Ctrl = ctrl
-	tab.model = model
-	tab.Label = ctrl.Label()
-	tab.StartupErr = ""
-	a.mu.Unlock()
+	old := a.ctrl
+	a.ctrl = ctrl
+	a.model = model
+	a.label = ctrl.Label()
+	a.startupErr = ""
+	if old != nil {
+		old.Close()
+	}
 	ctrl.EnableInteractiveApproval()
 	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
 	if len(carried) > 0 {
@@ -273,12 +264,8 @@ func withFreshSystemPrompt(messages []provider.Message, system string) []provide
 
 // SetDefaultModel sets the config default and switches the live model to it.
 func (a *App) SetDefaultModel(ref string) error {
-	tab := a.activeTab()
-	if tab == nil {
-		return fmt.Errorf("no active tab")
-	}
-	prev := tab.model
-	tab.model = ref
+	prev := a.model
+	a.model = ref
 	if err := a.applyConfigChange(func(c *config.Config) error {
 		if _, ok := c.ResolveModel(ref); !ok {
 			return fmt.Errorf("unknown model %q", ref)
@@ -286,7 +273,7 @@ func (a *App) SetDefaultModel(ref string) error {
 		c.DefaultModel = ref
 		return nil
 	}); err != nil {
-		tab.model = prev
+		a.model = prev
 		return err
 	}
 	return nil

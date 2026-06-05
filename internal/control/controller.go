@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/billing"
@@ -1199,6 +1200,8 @@ func (c *Controller) Balance(ctx context.Context) (*billing.Balance, error) {
 	if strings.TrimSpace(c.balanceURL) == "" {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
 	return billing.FetchWithClient(ctx, c.balanceClient, c.balanceURL, c.balanceKey)
 }
 
@@ -1387,7 +1390,13 @@ func (c *Controller) connectCodegraphMCPServer(cfg *config.Config) (int, error) 
 	if err := codegraph.EnsureInit(c.pluginCtx, bin, cwd); err != nil {
 		return 0, fmt.Errorf("codegraph init: %w", err)
 	}
-	return c.connectMCPSpec(plugin.Spec{Name: "codegraph", Command: bin, Args: []string{"serve", "--mcp"}, Dir: cwd})
+	return c.connectMCPSpec(plugin.Spec{
+		Name:              "codegraph",
+		Command:           bin,
+		Args:              []string{"serve", "--mcp"},
+		Dir:               cwd,
+		ReadOnlyToolNames: codegraph.ReadOnlyToolNames(),
+	})
 }
 
 // RemoveMCPServer disconnects a live MCP server — its tools vanish from the next

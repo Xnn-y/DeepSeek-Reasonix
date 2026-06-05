@@ -45,11 +45,24 @@ export interface WireUsage {
   cacheHitTokens: number;
   cacheMissTokens: number;
   reasoningTokens?: number;
+  cacheDiagnostics?: WireCacheDiagnostics;
   // Session-cumulative cache tokens — the status bar shows the aggregate
   // hit-rate (Σhit/Σ(hit+miss)), steadier than the single-turn cacheHitTokens.
   sessionCacheHitTokens: number;
   sessionCacheMissTokens: number;
   costUsd?: number;
+}
+
+export interface WireCacheDiagnostics {
+  prefixHash: string;
+  prefixChanged: boolean;
+  prefixChangeReasons?: string[];
+  systemHash: string;
+  toolsHash: string;
+  logRewriteVersion: number;
+  toolSchemaTokens: number;
+  cacheMissTokens: number;
+  cacheHitTokens: number;
 }
 
 export interface WireApproval {
@@ -95,75 +108,6 @@ export interface WireEvent {
   err?: string;
   retryAttempt?: number;
   retryMax?: number;
-  // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
-  // route each event to the correct per-tab reducer.
-  tabId?: string;
-  sessionHitTokens?: number;
-  sessionMissTokens?: number;
-  sessionCostUsd?: number;
-}
-
-// Tab management types (desktop/tabs.go).
-export interface TabMeta {
-  id: string;
-  scope: string;
-  workspaceRoot: string;
-  workspaceName: string;
-  topicId: string;
-  topicTitle: string;
-  label: string;
-  ready: boolean;
-  running: boolean;
-  startupErr?: string;
-  active: boolean;
-  cwd: string;
-}
-
-export interface ProjectNode {
-  key: string;
-  kind: "project" | "topic" | "global_folder" | "global_topic";
-  label: string;
-  root?: string;
-  topicId?: string;
-  children?: ProjectNode[];
-}
-
-export interface TopicMeta {
-  id: string;
-  title: string;
-  createdAt: number;
-}
-
-export interface ContextPanelInfo {
-  usedTokens: number;
-  windowTokens: number;
-  promptTokens: number;
-  completionTokens: number;
-  reasoningTokens: number;
-  cacheHitTokens: number;
-  cacheMissTokens: number;
-  sessionCostUsd: number;
-  readFiles: ReadFileRecord[];
-  changedFiles: ChangedFileInfo[];
-}
-
-export interface ReadFileRecord {
-  path: string;
-  turn: number;
-  time: number;
-  offset?: number;
-  limit?: number;
-  truncated?: boolean;
-}
-
-export interface ChangedFileInfo {
-  path: string;
-  oldPath?: string;
-  sources: string[];
-  gitStatus?: string;
-  turns: number[];
-  latestPrompt?: string;
-  latestTime?: number;
 }
 
 // Bound-method payloads (desktop/app.go).
@@ -191,10 +135,6 @@ export interface SessionMeta {
   lastActivityAt?: number; // unix milliseconds
   modTime: number; // compatibility alias for lastActivityAt
   current: boolean;
-  scope?: string;       // "project" | "global"; empty for legacy → treated as "global"
-  workspaceRoot?: string;
-  topicId?: string;
-  topicTitle?: string;
 }
 
 export interface WorkspaceView {
@@ -284,27 +224,20 @@ export interface ServerView {
   args?: string[];
   url?: string;
   envKeys?: string[];
+  authStatus?: string;
+  authUrl?: string;
+  authConfigured?: boolean;
   tools: number;
   prompts: number;
   resources: number;
   error?: string;
   toolList?: MCPToolView[];
-  authStatus?: "none" | "possible" | "required" | string;
-  authUrl?: string;
-  authConfigured?: boolean;
 }
 export interface MCPToolView {
   name: string;
   description: string;
 }
 export interface SkillView {
-  name: string;
-  description: string;
-  scope: string;
-  runAs: string;
-  enabled: boolean;
-}
-export interface SkillRootSkillView {
   name: string;
   description: string;
   scope: string;
